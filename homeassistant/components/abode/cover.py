@@ -1,39 +1,25 @@
-"""
-This component provides HA cover support for Abode Security System.
+"""Support for Abode Security System covers."""
+import abodepy.helpers.constants as CONST
 
-For more details about this platform, please refer to the documentation at
-https://home-assistant.io/components/cover.abode/
-"""
-import logging
+from homeassistant.components.cover import CoverEntity
 
-from homeassistant.components.abode import AbodeDevice, DOMAIN as ABODE_DOMAIN
-from homeassistant.components.cover import CoverDevice
+from . import AbodeDevice
+from .const import DOMAIN
 
 
-DEPENDENCIES = ['abode']
-
-_LOGGER = logging.getLogger(__name__)
-
-
-def setup_platform(hass, config, add_entities, discovery_info=None):
+async def async_setup_entry(hass, config_entry, async_add_entities):
     """Set up Abode cover devices."""
-    import abodepy.helpers.constants as CONST
+    data = hass.data[DOMAIN]
 
-    data = hass.data[ABODE_DOMAIN]
+    entities = []
 
-    devices = []
     for device in data.abode.get_devices(generic_type=CONST.TYPE_COVER):
-        if data.is_excluded(device):
-            continue
+        entities.append(AbodeCover(data, device))
 
-        devices.append(AbodeCover(data, device))
-
-    data.devices.extend(devices)
-
-    add_entities(devices)
+    async_add_entities(entities)
 
 
-class AbodeCover(AbodeDevice, CoverDevice):
+class AbodeCover(AbodeDevice, CoverEntity):
     """Representation of an Abode cover."""
 
     @property

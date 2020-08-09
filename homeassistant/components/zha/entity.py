@@ -1,265 +1,58 @@
-"""
-Entity for Zigbee Home Automation.
+"""Entity for Zigbee Home Automation."""
 
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/zha/
-"""
 import asyncio
 import logging
-from random import uniform
+from typing import Any, Awaitable, Dict, List, Optional
 
-from homeassistant.const import ATTR_ENTITY_ID
-from homeassistant.core import callback
+from homeassistant.core import CALLBACK_TYPE, Event, callback
 from homeassistant.helpers import entity
 from homeassistant.helpers.device_registry import CONNECTION_ZIGBEE
-from homeassistant.util import slugify
+from homeassistant.helpers.dispatcher import (
+    async_dispatcher_connect,
+    async_dispatcher_send,
+)
+from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.restore_state import RestoreEntity
+
 from .core.const import (
-    DATA_ZHA, DATA_ZHA_BRIDGE_ID, DOMAIN, ATTR_CLUSTER_ID, ATTR_ATTRIBUTE,
-    ATTR_VALUE, ATTR_MANUFACTURER, ATTR_COMMAND, SERVER, ATTR_COMMAND_TYPE,
-    ATTR_ARGS, IN, OUT, CLIENT_COMMANDS, SERVER_COMMANDS)
-from .core.helpers import bind_configure_reporting
+    ATTR_MANUFACTURER,
+    ATTR_MODEL,
+    ATTR_NAME,
+    DATA_ZHA,
+    DATA_ZHA_BRIDGE_ID,
+    DOMAIN,
+    SIGNAL_GROUP_ENTITY_REMOVED,
+    SIGNAL_GROUP_MEMBERSHIP_CHANGE,
+    SIGNAL_REMOVE,
+    SIGNAL_REMOVE_GROUP,
+)
+from .core.helpers import LogMixin
+from .core.typing import CALLABLE_T, ChannelType, ZhaDeviceType
 
 _LOGGER = logging.getLogger(__name__)
 
-ENTITY_SUFFIX = 'entity_suffix'
+ENTITY_SUFFIX = "entity_suffix"
 
 
-class ZhaEntity(entity.Entity):
+class BaseZhaEntity(LogMixin, entity.Entity):
     """A base class for ZHA entities."""
 
-    _domain = None  # Must be overridden by subclasses
-
-    def __init__(self, endpoint, in_clusters, out_clusters, manufacturer,
-                 model, application_listener, unique_id, new_join=False,
-                 **kwargs):
+    def __init__(self, unique_id: str, zha_device: ZhaDeviceType, **kwargs):
         """Init ZHA entity."""
-        self._device_state_attributes = {}
-        self._name = None
-        ieee = endpoint.device.ieee
-        ieeetail = ''.join(['%02x' % (o, ) for o in ieee[-4:]])
-        if manufacturer and model is not None:
-            self.entity_id = "{}.{}_{}_{}_{}{}".format(
-                self._domain,
-                slugify(manufacturer),
-                slugify(model),
-                ieeetail,
-                endpoint.endpoint_id,
-                kwargs.get(ENTITY_SUFFIX, ''),
-            )
-            self._name = "{} {}".format(manufacturer, model)
-        else:
-            self.entity_id = "{}.zha_{}_{}{}".format(
-                self._domain,
-                ieeetail,
-                endpoint.endpoint_id,
-                kwargs.get(ENTITY_SUFFIX, ''),
-            )
-
-        self._endpoint = endpoint
-        self._in_clusters = in_clusters
-        self._out_clusters = out_clusters
-        self._new_join = new_join
-        self._state = None
-        self._unique_id = unique_id
-
-        # Normally the entity itself is the listener. Sub-classes may set this
-        # to a dict of cluster ID -> listener to receive messages for specific
-        # clusters separately
-        self._in_listeners = {}
-        self._out_listeners = {}
-
-        self._initialized = False
-        self.manufacturer_code = None
-        application_listener.register_entity(ieee, self)
-
-    async def get_clusters(self):
-        """Get zigbee clusters from this entity."""
-        return {
-            IN: self._in_clusters,
-            OUT: self._out_clusters
-        }
-
-    async def _get_cluster(self, cluster_id, cluster_type=IN):
-        """Get zigbee cluster from this entity."""
-        if cluster_type == IN:
-            cluster = self._in_clusters[cluster_id]
-        else:
-            cluster = self._out_clusters[cluster_id]
-        if cluster is None:
-            _LOGGER.warning('in_cluster with id: %s not found on entity: %s',
-                            cluster_id, self.entity_id)
-        return cluster
-
-    async def get_cluster_attributes(self, cluster_id, cluster_type=IN):
-        """Get zigbee attributes for specified cluster."""
-        cluster = await self._get_cluster(cluster_id, cluster_type)
-        if cluster is None:
-            return
-        return cluster.attributes
-
-    async def write_zigbe_attribute(self, cluster_id, attribute, value,
-                                    cluster_type=IN, manufacturer=None):
-        """Write a value to a zigbee attribute for a cluster in this entity."""
-        cluster = await self._get_cluster(cluster_id, cluster_type)
-        if cluster is None:
-            return
-
-        from zigpy.exceptions import DeliveryError
-        try:
-            response = await cluster.write_attributes(
-                {attribute: value},
-                manufacturer=manufacturer
-            )
-            _LOGGER.debug(
-                'set: %s for attr: %s to cluster: %s for entity: %s - res: %s',
-                value,
-                attribute,
-                cluster_id,
-                self.entity_id,
-                response
-            )
-            return response
-        except DeliveryError as exc:
-            _LOGGER.debug(
-                'failed to set attribute: %s %s %s %s %s',
-                '{}: {}'.format(ATTR_VALUE, value),
-                '{}: {}'.format(ATTR_ATTRIBUTE, attribute),
-                '{}: {}'.format(ATTR_CLUSTER_ID, cluster_id),
-                '{}: {}'.format(ATTR_ENTITY_ID, self.entity_id),
-                exc
-            )
-
-    async def get_cluster_commands(self, cluster_id, cluster_type=IN):
-        """Get zigbee commands for specified cluster."""
-        cluster = await self._get_cluster(cluster_id, cluster_type)
-        if cluster is None:
-            return
-        return {
-            CLIENT_COMMANDS: cluster.client_commands,
-            SERVER_COMMANDS: cluster.server_commands,
-        }
-
-    async def issue_cluster_command(self, cluster_id, command, command_type,
-                                    args, cluster_type=IN,
-                                    manufacturer=None):
-        """Issue a command against specified zigbee cluster on this entity."""
-        cluster = await self._get_cluster(cluster_id, cluster_type)
-        if cluster is None:
-            return
-        response = None
-        if command_type == SERVER:
-            response = await cluster.command(command, *args,
-                                             manufacturer=manufacturer,
-                                             expect_reply=True)
-        else:
-            response = await cluster.client_command(command, *args)
-
-        _LOGGER.debug(
-            'Issued cluster command: %s %s %s %s %s %s %s',
-            '{}: {}'.format(ATTR_CLUSTER_ID, cluster_id),
-            '{}: {}'.format(ATTR_COMMAND, command),
-            '{}: {}'.format(ATTR_COMMAND_TYPE, command_type),
-            '{}: {}'.format(ATTR_ARGS, args),
-            '{}: {}'.format(ATTR_CLUSTER_ID, cluster_type),
-            '{}: {}'.format(ATTR_MANUFACTURER, manufacturer),
-            '{}: {}'.format(ATTR_ENTITY_ID, self.entity_id)
-        )
-        return response
-
-    async def async_added_to_hass(self):
-        """Handle entity addition to hass.
-
-        It is now safe to update the entity state
-        """
-        for cluster_id, cluster in self._in_clusters.items():
-            cluster.add_listener(self._in_listeners.get(cluster_id, self))
-        for cluster_id, cluster in self._out_clusters.items():
-            cluster.add_listener(self._out_listeners.get(cluster_id, self))
-
-        self._endpoint.device.zdo.add_listener(self)
-
-        if self._new_join:
-            self.hass.async_create_task(self.async_configure())
-
-        self._initialized = True
-
-    async def async_configure(self):
-        """Set cluster binding and attribute reporting."""
-        for cluster_key, attrs in self.zcl_reporting_config.items():
-            cluster = self._get_cluster_from_report_config(cluster_key)
-            if cluster is None:
-                continue
-
-            manufacturer = None
-            if cluster.cluster_id >= 0xfc00 and self.manufacturer_code:
-                manufacturer = self.manufacturer_code
-
-            skip_bind = False  # bind cluster only for the 1st configured attr
-            for attr, details in attrs.items():
-                min_report_interval, max_report_interval, change = details
-                await bind_configure_reporting(
-                    self.entity_id, cluster, attr,
-                    min_report=min_report_interval,
-                    max_report=max_report_interval,
-                    reportable_change=change,
-                    skip_bind=skip_bind,
-                    manufacturer=manufacturer
-                )
-                skip_bind = True
-                await asyncio.sleep(uniform(0.1, 0.5))
-        _LOGGER.debug("%s: finished configuration", self.entity_id)
-
-    def _get_cluster_from_report_config(self, cluster_key):
-        """Parse an entry from zcl_reporting_config dict."""
-        from zigpy.zcl import Cluster as Zcl_Cluster
-
-        cluster = None
-        if isinstance(cluster_key, Zcl_Cluster):
-            cluster = cluster_key
-        elif isinstance(cluster_key, str):
-            cluster = getattr(self._endpoint, cluster_key, None)
-        elif isinstance(cluster_key, int):
-            if cluster_key in self._in_clusters:
-                cluster = self._in_clusters[cluster_key]
-            elif cluster_key in self._out_clusters:
-                cluster = self._out_clusters[cluster_key]
-        elif issubclass(cluster_key, Zcl_Cluster):
-            cluster_id = cluster_key.cluster_id
-            if cluster_id in self._in_clusters:
-                cluster = self._in_clusters[cluster_id]
-            elif cluster_id in self._out_clusters:
-                cluster = self._out_clusters[cluster_id]
-        return cluster
+        self._name: str = ""
+        self._force_update: bool = False
+        self._should_poll: bool = False
+        self._unique_id: str = unique_id
+        self._state: Any = None
+        self._device_state_attributes: Dict[str, Any] = {}
+        self._zha_device: ZhaDeviceType = zha_device
+        self._unsubs: List[CALLABLE_T] = []
+        self.remove_future: Awaitable[None] = None
 
     @property
-    def name(self):
+    def name(self) -> str:
         """Return Entity's default name."""
         return self._name
-
-    @property
-    def zcl_reporting_config(self):
-        """Return a dict of ZCL attribute reporting configuration.
-
-        {
-            Cluster_Class: {
-                attr_id: (min_report_interval, max_report_interval, change),
-                attr_name: (min_rep_interval, max_rep_interval, change)
-            }
-            Cluster_Instance: {
-                attr_id: (min_report_interval, max_report_interval, change),
-                attr_name: (min_rep_interval, max_rep_interval, change)
-            }
-            cluster_id: {
-                attr_id: (min_report_interval, max_report_interval, change),
-                attr_name: (min_rep_interval, max_rep_interval, change)
-            }
-            'cluster_name': {
-                attr_id: (min_report_interval, max_report_interval, change),
-                attr_name: (min_rep_interval, max_rep_interval, change)
-            }
-        }
-        """
-        return {}
 
     @property
     def unique_id(self) -> str:
@@ -267,49 +60,214 @@ class ZhaEntity(entity.Entity):
         return self._unique_id
 
     @property
-    def device_state_attributes(self):
+    def zha_device(self) -> ZhaDeviceType:
+        """Return the zha device this entity is attached to."""
+        return self._zha_device
+
+    @property
+    def device_state_attributes(self) -> Dict[str, Any]:
         """Return device specific state attributes."""
         return self._device_state_attributes
 
     @property
-    def should_poll(self) -> bool:
-        """Let ZHA handle polling."""
-        return False
-
-    @callback
-    def attribute_updated(self, attribute, value):
-        """Handle an attribute updated on this cluster."""
-        pass
-
-    @callback
-    def zdo_command(self, tsn, command_id, args):
-        """Handle a ZDO command received on this cluster."""
-        pass
-
-    @callback
-    def device_announce(self, device):
-        """Handle device_announce zdo event."""
-        self.async_schedule_update_ha_state(force_refresh=True)
-
-    @callback
-    def permit_duration(self, permit_duration):
-        """Handle permit_duration zdo event."""
-        pass
+    def force_update(self) -> bool:
+        """Force update this entity."""
+        return self._force_update
 
     @property
-    def device_info(self):
+    def should_poll(self) -> bool:
+        """Poll state from device."""
+        return self._should_poll
+
+    @property
+    def device_info(self) -> Dict[str, Any]:
         """Return a device description for device registry."""
-        ieee = str(self._endpoint.device.ieee)
+        zha_device_info = self._zha_device.device_info
+        ieee = zha_device_info["ieee"]
         return {
-            'connections': {(CONNECTION_ZIGBEE, ieee)},
-            'identifiers': {(DOMAIN, ieee)},
-            ATTR_MANUFACTURER: self._endpoint.manufacturer,
-            'model': self._endpoint.model,
-            'name': self.name or ieee,
-            'via_hub': (DOMAIN, self.hass.data[DATA_ZHA][DATA_ZHA_BRIDGE_ID]),
+            "connections": {(CONNECTION_ZIGBEE, ieee)},
+            "identifiers": {(DOMAIN, ieee)},
+            ATTR_MANUFACTURER: zha_device_info[ATTR_MANUFACTURER],
+            ATTR_MODEL: zha_device_info[ATTR_MODEL],
+            ATTR_NAME: zha_device_info[ATTR_NAME],
+            "via_device": (DOMAIN, self.hass.data[DATA_ZHA][DATA_ZHA_BRIDGE_ID]),
         }
 
     @callback
-    def zha_send_event(self, cluster, command, args):
-        """Relay entity events to hass."""
-        pass  # don't relay events from entities
+    def async_state_changed(self) -> None:
+        """Entity state changed."""
+        self.async_write_ha_state()
+
+    @callback
+    def async_update_state_attribute(self, key: str, value: Any) -> None:
+        """Update a single device state attribute."""
+        self._device_state_attributes.update({key: value})
+        self.async_write_ha_state()
+
+    @callback
+    def async_set_state(self, attr_id: int, attr_name: str, value: Any) -> None:
+        """Set the entity state."""
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Disconnect entity object when removed."""
+        for unsub in self._unsubs[:]:
+            unsub()
+            self._unsubs.remove(unsub)
+
+    @callback
+    def async_accept_signal(
+        self, channel: ChannelType, signal: str, func: CALLABLE_T, signal_override=False
+    ):
+        """Accept a signal from a channel."""
+        unsub = None
+        if signal_override:
+            unsub = async_dispatcher_connect(self.hass, signal, func)
+        else:
+            unsub = async_dispatcher_connect(
+                self.hass, f"{channel.unique_id}_{signal}", func
+            )
+        self._unsubs.append(unsub)
+
+    def log(self, level: int, msg: str, *args):
+        """Log a message."""
+        msg = f"%s: {msg}"
+        args = (self.entity_id,) + args
+        _LOGGER.log(level, msg, *args)
+
+
+class ZhaEntity(BaseZhaEntity, RestoreEntity):
+    """A base class for non group ZHA entities."""
+
+    def __init__(
+        self,
+        unique_id: str,
+        zha_device: ZhaDeviceType,
+        channels: List[ChannelType],
+        **kwargs,
+    ):
+        """Init ZHA entity."""
+        super().__init__(unique_id, zha_device, **kwargs)
+        ieeetail = "".join([f"{o:02x}" for o in zha_device.ieee[:4]])
+        ch_names = [ch.cluster.ep_attribute for ch in channels]
+        ch_names = ", ".join(sorted(ch_names))
+        self._name: str = f"{zha_device.name} {ieeetail} {ch_names}"
+        self.cluster_channels: Dict[str, ChannelType] = {}
+        for channel in channels:
+            self.cluster_channels[channel.name] = channel
+
+    @property
+    def available(self) -> bool:
+        """Return entity availability."""
+        return self._zha_device.available
+
+    async def async_added_to_hass(self) -> None:
+        """Run when about to be added to hass."""
+        self.remove_future = asyncio.Future()
+        self.async_accept_signal(
+            None,
+            f"{SIGNAL_REMOVE}_{self.zha_device.ieee}",
+            self.async_remove,
+            signal_override=True,
+        )
+
+        if not self.zha_device.is_mains_powered:
+            # mains powered devices will get real time state
+            last_state = await self.async_get_last_state()
+            if last_state:
+                self.async_restore_last_state(last_state)
+
+        self.async_accept_signal(
+            None,
+            f"{self.zha_device.available_signal}_entity",
+            self.async_state_changed,
+            signal_override=True,
+        )
+        self._zha_device.gateway.register_entity_reference(
+            self._zha_device.ieee,
+            self.entity_id,
+            self._zha_device,
+            self.cluster_channels,
+            self.device_info,
+            self.remove_future,
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Disconnect entity object when removed."""
+        await super().async_will_remove_from_hass()
+        self.zha_device.gateway.remove_entity_reference(self)
+        self.remove_future.set_result(True)
+
+    @callback
+    def async_restore_last_state(self, last_state) -> None:
+        """Restore previous state."""
+
+    async def async_update(self) -> None:
+        """Retrieve latest state."""
+        for channel in self.cluster_channels.values():
+            if hasattr(channel, "async_update"):
+                await channel.async_update()
+
+
+class ZhaGroupEntity(BaseZhaEntity):
+    """A base class for ZHA group entities."""
+
+    def __init__(
+        self, entity_ids: List[str], unique_id: str, group_id: int, zha_device, **kwargs
+    ) -> None:
+        """Initialize a light group."""
+        super().__init__(unique_id, zha_device, **kwargs)
+        self._available = False
+        self._name = (
+            f"{zha_device.gateway.groups.get(group_id).name}_zha_group_0x{group_id:04x}"
+        )
+        self._group_id: int = group_id
+        self._entity_ids: List[str] = entity_ids
+        self._async_unsub_state_changed: Optional[CALLBACK_TYPE] = None
+
+    @property
+    def available(self) -> bool:
+        """Return entity availability."""
+        return self._available
+
+    async def async_added_to_hass(self) -> None:
+        """Register callbacks."""
+        await super().async_added_to_hass()
+        self.async_accept_signal(
+            None,
+            f"{SIGNAL_REMOVE_GROUP}_0x{self._group_id:04x}",
+            self.async_remove,
+            signal_override=True,
+        )
+
+        self.async_accept_signal(
+            None,
+            f"{SIGNAL_GROUP_MEMBERSHIP_CHANGE}_0x{self._group_id:04x}",
+            self.async_remove,
+            signal_override=True,
+        )
+
+        self._async_unsub_state_changed = async_track_state_change_event(
+            self.hass, self._entity_ids, self.async_state_changed_listener
+        )
+
+        def send_removed_signal():
+            async_dispatcher_send(
+                self.hass, SIGNAL_GROUP_ENTITY_REMOVED, self._group_id
+            )
+
+        self.async_on_remove(send_removed_signal)
+
+    @callback
+    def async_state_changed_listener(self, event: Event):
+        """Handle child updates."""
+        self.async_schedule_update_ha_state(True)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Handle removal from Home Assistant."""
+        await super().async_will_remove_from_hass()
+        if self._async_unsub_state_changed is not None:
+            self._async_unsub_state_changed()
+            self._async_unsub_state_changed = None
+
+    async def async_update(self) -> None:
+        """Update the state of the group entity."""

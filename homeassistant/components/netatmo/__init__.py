@@ -1,119 +1,205 @@
-"""
-Support for the Netatmo devices.
-
-For more details about this platform, please refer to the documentation at
-https://home-assistant.io/components/netatmo/
-"""
+"""The Netatmo integration."""
+import asyncio
 import logging
-from datetime import timedelta
-from urllib.error import HTTPError
+import secrets
 
+import pyatmo
 import voluptuous as vol
 
+from homeassistant.components import cloud
+from homeassistant.components.webhook import (
+    async_register as webhook_register,
+    async_unregister as webhook_unregister,
+)
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    CONF_API_KEY, CONF_PASSWORD, CONF_USERNAME, CONF_DISCOVERY)
-from homeassistant.helpers import discovery
-import homeassistant.helpers.config_validation as cv
-from homeassistant.util import Throttle
+    CONF_CLIENT_ID,
+    CONF_CLIENT_SECRET,
+    CONF_WEBHOOK_ID,
+    EVENT_HOMEASSISTANT_START,
+    EVENT_HOMEASSISTANT_STOP,
+)
+from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.helpers import config_entry_oauth2_flow, config_validation as cv
 
-REQUIREMENTS = ['pyatmo==1.4']
+from . import api, config_flow
+from .const import (
+    AUTH,
+    CONF_CLOUDHOOK_URL,
+    DATA_DEVICE_IDS,
+    DATA_HANDLER,
+    DATA_HOMES,
+    DATA_PERSONS,
+    DATA_SCHEDULES,
+    DOMAIN,
+    OAUTH2_AUTHORIZE,
+    OAUTH2_TOKEN,
+)
+from .data_handler import NetatmoDataHandler
+from .webhook import handle_webhook
 
 _LOGGER = logging.getLogger(__name__)
 
-CONF_SECRET_KEY = 'secret_key'
+CONFIG_SCHEMA = vol.Schema(
+    {
+        DOMAIN: vol.Schema(
+            {
+                vol.Required(CONF_CLIENT_ID): cv.string,
+                vol.Required(CONF_CLIENT_SECRET): cv.string,
+            }
+        )
+    },
+    extra=vol.ALLOW_EXTRA,
+)
 
-DOMAIN = 'netatmo'
-
-NETATMO_AUTH = None
-DEFAULT_DISCOVERY = True
-
-MIN_TIME_BETWEEN_UPDATES = timedelta(minutes=10)
-MIN_TIME_BETWEEN_EVENT_UPDATES = timedelta(seconds=10)
-
-CONFIG_SCHEMA = vol.Schema({
-    DOMAIN: vol.Schema({
-        vol.Required(CONF_API_KEY): cv.string,
-        vol.Required(CONF_PASSWORD): cv.string,
-        vol.Required(CONF_SECRET_KEY): cv.string,
-        vol.Required(CONF_USERNAME): cv.string,
-        vol.Optional(CONF_DISCOVERY, default=DEFAULT_DISCOVERY): cv.boolean,
-    })
-}, extra=vol.ALLOW_EXTRA)
+PLATFORMS = ["camera", "climate", "sensor"]
 
 
-def setup(hass, config):
-    """Set up the Netatmo devices."""
-    import pyatmo
+async def async_setup(hass: HomeAssistant, config: dict):
+    """Set up the Netatmo component."""
+    hass.data[DOMAIN] = {}
+    hass.data[DOMAIN][DATA_PERSONS] = {}
+    hass.data[DOMAIN][DATA_DEVICE_IDS] = {}
+    hass.data[DOMAIN][DATA_SCHEDULES] = {}
+    hass.data[DOMAIN][DATA_HOMES] = {}
 
-    global NETATMO_AUTH
-    try:
-        NETATMO_AUTH = pyatmo.ClientAuth(
-            config[DOMAIN][CONF_API_KEY], config[DOMAIN][CONF_SECRET_KEY],
-            config[DOMAIN][CONF_USERNAME], config[DOMAIN][CONF_PASSWORD],
-            'read_station read_camera access_camera '
-            'read_thermostat write_thermostat '
-            'read_presence access_presence read_homecoach')
-    except HTTPError:
-        _LOGGER.error("Unable to connect to Netatmo API")
-        return False
+    if DOMAIN not in config:
+        return True
 
-    if config[DOMAIN][CONF_DISCOVERY]:
-        for component in 'camera', 'sensor', 'binary_sensor', 'climate':
-            discovery.load_platform(hass, component, DOMAIN, {}, config)
+    config_flow.NetatmoFlowHandler.async_register_implementation(
+        hass,
+        config_entry_oauth2_flow.LocalOAuth2Implementation(
+            hass,
+            DOMAIN,
+            config[DOMAIN][CONF_CLIENT_ID],
+            config[DOMAIN][CONF_CLIENT_SECRET],
+            OAUTH2_AUTHORIZE,
+            OAUTH2_TOKEN,
+        ),
+    )
 
     return True
 
 
-class CameraData:
-    """Get the latest data from Netatmo."""
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+    """Set up Netatmo from a config entry."""
+    implementation = await config_entry_oauth2_flow.async_get_config_entry_implementation(
+        hass, entry
+    )
 
-    def __init__(self, auth, home=None):
-        """Initialize the data object."""
-        self.auth = auth
-        self.camera_data = None
-        self.camera_names = []
-        self.module_names = []
-        self.home = home
-        self.camera_type = None
+    # Set unique id if non was set (migration)
+    if not entry.unique_id:
+        hass.config_entries.async_update_entry(entry, unique_id=DOMAIN)
 
-    def get_camera_names(self):
-        """Return all camera available on the API as a list."""
-        self.camera_names = []
-        self.update()
-        if not self.home:
-            for home in self.camera_data.cameras:
-                for camera in self.camera_data.cameras[home].values():
-                    self.camera_names.append(camera['name'])
+    hass.data[DOMAIN][entry.entry_id] = {
+        AUTH: api.ConfigEntryNetatmoAuth(hass, entry, implementation)
+    }
+
+    data_handler = NetatmoDataHandler(hass, entry)
+    await data_handler.async_setup()
+    hass.data[DOMAIN][entry.entry_id][DATA_HANDLER] = data_handler
+
+    for component in PLATFORMS:
+        hass.async_create_task(
+            hass.config_entries.async_forward_entry_setup(entry, component)
+        )
+
+    async def unregister_webhook(_):
+        if CONF_WEBHOOK_ID not in entry.data:
+            return
+        _LOGGER.debug("Unregister Netatmo webhook (%s)", entry.data[CONF_WEBHOOK_ID])
+        webhook_unregister(hass, entry.data[CONF_WEBHOOK_ID])
+
+    async def register_webhook(event):
+        if CONF_WEBHOOK_ID not in entry.data:
+            data = {**entry.data, CONF_WEBHOOK_ID: secrets.token_hex()}
+            hass.config_entries.async_update_entry(entry, data=data)
+
+        if hass.components.cloud.async_active_subscription():
+            if CONF_CLOUDHOOK_URL not in entry.data:
+                webhook_url = await hass.components.cloud.async_create_cloudhook(
+                    entry.data[CONF_WEBHOOK_ID]
+                )
+                data = {**entry.data, CONF_CLOUDHOOK_URL: webhook_url}
+                hass.config_entries.async_update_entry(entry, data=data)
+            else:
+                webhook_url = entry.data[CONF_CLOUDHOOK_URL]
         else:
-            for camera in self.camera_data.cameras[self.home].values():
-                self.camera_names.append(camera['name'])
-        return self.camera_names
+            webhook_url = hass.components.webhook.async_generate_url(
+                entry.data[CONF_WEBHOOK_ID]
+            )
 
-    def get_module_names(self, camera_name):
-        """Return all module available on the API as a list."""
-        self.module_names = []
-        self.update()
-        cam_id = self.camera_data.cameraByName(camera=camera_name,
-                                               home=self.home)['id']
-        for module in self.camera_data.modules.values():
-            if cam_id == module['cam_id']:
-                self.module_names.append(module['name'])
-        return self.module_names
+        if entry.data["auth_implementation"] == "cloud" and not webhook_url.startswith(
+            "https://"
+        ):
+            _LOGGER.warning(
+                "Webhook not registered - "
+                "https and port 443 is required to register the webhook"
+            )
+            return
 
-    def get_camera_type(self, camera=None, home=None, cid=None):
-        """Return camera type for a camera, cid has preference over camera."""
-        self.camera_type = self.camera_data.cameraType(camera=camera,
-                                                       home=home, cid=cid)
-        return self.camera_type
+        try:
+            webhook_register(
+                hass, DOMAIN, "Netatmo", entry.data[CONF_WEBHOOK_ID], handle_webhook
+            )
+            await hass.async_add_executor_job(
+                hass.data[DOMAIN][entry.entry_id][AUTH].addwebhook, webhook_url
+            )
+            _LOGGER.info("Register Netatmo webhook: %s", webhook_url)
+            hass.async_create_task(
+                hass.config_entries.async_forward_entry_setup(entry, "light")
+            )
+        except pyatmo.ApiError as err:
+            _LOGGER.error("Error during webhook registration - %s", err)
 
-    @Throttle(MIN_TIME_BETWEEN_UPDATES)
-    def update(self):
-        """Call the Netatmo API to update the data."""
-        import pyatmo
-        self.camera_data = pyatmo.CameraData(self.auth, size=100)
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, unregister_webhook)
 
-    @Throttle(MIN_TIME_BETWEEN_EVENT_UPDATES)
-    def update_event(self):
-        """Call the Netatmo API to update the events."""
-        self.camera_data.updateEvent(
-            home=self.home, cameratype=self.camera_type)
+    if hass.state == CoreState.running:
+        await register_webhook(None)
+    else:
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_START, register_webhook)
+
+    hass.services.async_register(DOMAIN, "register_webhook", register_webhook)
+    hass.services.async_register(DOMAIN, "unregister_webhook", unregister_webhook)
+
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+    """Unload a config entry."""
+    if CONF_WEBHOOK_ID in entry.data:
+        await hass.async_add_executor_job(
+            hass.data[DOMAIN][entry.entry_id][AUTH].dropwebhook
+        )
+        _LOGGER.info("Unregister Netatmo webhook.")
+
+    await hass.data[DOMAIN][entry.entry_id][DATA_HANDLER].async_cleanup()
+
+    unload_ok = all(
+        await asyncio.gather(
+            *[
+                hass.config_entries.async_forward_entry_unload(entry, component)
+                for component in PLATFORMS
+            ]
+        )
+    )
+
+    if unload_ok:
+        hass.data[DOMAIN].pop(entry.entry_id)
+
+    return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry):
+    """Cleanup when entry is removed."""
+    if (
+        CONF_WEBHOOK_ID in entry.data
+        and hass.components.cloud.async_active_subscription()
+    ):
+        try:
+            _LOGGER.debug(
+                "Removing Netatmo cloudhook (%s)", entry.data[CONF_WEBHOOK_ID]
+            )
+            await cloud.async_delete_cloudhook(hass, entry.data[CONF_WEBHOOK_ID])
+        except cloud.CloudNotAvailable:
+            pass
